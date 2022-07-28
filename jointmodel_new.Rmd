@@ -1,0 +1,526 @@
+---
+title: "Joint Modelling"
+output: 
+   html_document:
+     toc: true 
+     number_sections: true
+     code_folding: hide
+---
+
+```{r setup, include=FALSE, results='hide', message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+## load R packages
+library(haven); library(dplyr); library(tidyverse); library(rstanarm);
+options(mc.cores = parallel::detectCores())
+```
+
+## Data Cleaning
+
+
+### Survival Data
+
+```{r survdata}
+##
+nms <- dir("42753/")
+nms <- nms[!nms%in%nms[c(9,10,11,12)]]
+##
+## prepare data based on "42753 AnzdataTransplantSerumCreatinine 20210928.dta"
+dat <- read_dta("42753/42753 AnzdataTransplantSerumCreatinine 20210928.dta")
+print("42753 AnzdataTransplantSerumCreatinine 20210928.dta")
+dat <- na.omit(dat)
+dat_tmp <- read_dta("42753/42753 AnzdataTransplants 20210928.dta")
+print("42753 AnzdataTransplants 20210928.dta")
+names(dat_tmp)
+#keep.var <- c("id","graftno","donorage","donorgendercode","graftfailuredate","lastfollowupdate","transplantdate")
+keep.var <- c("id","graftno","donorage","donorgendercode","donor_deathcategorycode","donor_diabetescode","graftfailuredate","lastfollowupdate","transplantdate","endtransplantdate","timeondialysis","graftfailurecausecode","gfailcat","endtransplantcode","transplantstatus","transplantperiod","alivestatus","aliveperiod","hlamismatchesdr","transplantcentrestate")
+dat_tmp <- dat_tmp[,keep.var]
+dat.vars <- names(dat_tmp); 
+unq.var <- names(dat)[names(dat)%in%dat.vars]; 
+dat <- full_join(dat, dat_tmp, by = unq.var)
+dat$ts <- dat$lastfollowupdate-dat$graftfailuredate
+##
+dat[!is.na(dat$donor_deathcategorycode),"donor_deathcategorycode"] <- 0 # deceased donor
+dat[is.na(dat$donor_deathcategorycode),"donor_deathcategorycode"] <- 1 # alive donor
+##
+## leave this dataset out, check the variable names
+## cancer
+#dat_tmp <- read_dta(paste0("42753/",nms[1])); nms[1]
+#dat.vars <- names(dat_tmp); 
+#keep.var <- c("id","graftno","cancerindonorcode")
+#dat_tmp <- dat_tmp[,keep.var]
+#unq.var <- names(dat)[names(dat)%in%keep.var];
+#dat <- full_join(dat, dat_tmp, by = unq.var)
+##
+## 
+## leave this dataset out, check the variable names
+## non-skin cancer
+#dat_tmp <- read_dta(paste0("42753/",nms[2])); nms[2]
+#dat.vars <- names(dat_tmp); 
+#keep.var <- c("id","cancertypecode","causeddeathcode")
+#dat_tmp <- dat_tmp[,keep.var]
+#unq.var <- names(dat)[names(dat)%in%keep.var]; 
+#dat <- full_join(dat, dat_tmp, by = unq.var)
+##
+## leave this dataset out, check the variable names
+## skin cancer
+#dat_tmp <- read_dta(paste0("42753/",nms[3])); nms[3]
+#dat.vars <- names(dat_tmp); 
+#keep.var <- c("id","causeddeathcode")
+#dat_tmp <- dat_tmp[,keep.var]
+#unq.var <- names(dat)[names(dat)%in%keep.var]; 
+#dat <- full_join(dat, dat_tmp, by = unq.var)
+##
+## Comorbidities
+dat_tmp <- read_dta(paste0("42753/",nms[4])); nms[4]
+dat.vars <- names(dat_tmp); 
+keep.var <- c("id","coronaryarterycode","peripheralvascularcode","cerebrovasularcode","diabetescode_text")
+dat_tmp <- dat_tmp[,keep.var]
+unq.var <- names(dat)[names(dat)%in%keep.var]; 
+dat <- full_join(dat, dat_tmp, by = unq.var)
+##
+## Patients data
+dat_tmp <- read_dta(paste0("42753/",nms[5])); nms[5]
+dat.vars <- names(dat_tmp); 
+keep.var <- c("id","height","weight","smokingcode","racialorigincode","primaryrenaldiseasecode","treatmentdate","deathdate")
+dat_tmp <- dat_tmp[,keep.var]
+dat_tmp$bmi <- (dat_tmp$weight/dat_tmp$height)/dat_tmp$height*10000 # from CDC website
+unq.var <- names(dat)[names(dat)%in%keep.var]; 
+dat <- full_join(dat, dat_tmp, by = unq.var)
+##
+dat <- dat %>% distinct()
+#save(dat,file="datafile_merged.RData") ## 
+#load(file="datafile_merged.RData") ## 
+##
+## prepare dataset for surv and long models with variables:
+## 
+##
+
+load(file="datafile_merged.RData") ## 
+
+dat <- dat[,c("id","graftno","egfr_ckdepi","monthcode","alivestatus","aliveperiod","transplantstatus","transplantperiod","ts",
+              "graftfailuredate","lastfollowupdate","transplantdate","endtransplantdate","treatmentdate","deathdate","timeondialysis",
+              "gendercode","age","bmi","smokingcode","gfailcat","racialorigincode","primaryrenaldiseasecode",
+              "donorage","donorgendercode","donor_deathcategorycode",
+              "coronaryarterycode","cerebrovasularcode","diabetescode_text",
+              "hlamismatchesdr","transplantcentrestate")]
+dat <- dat %>% distinct()
+dim(dat)
+##
+## keep age 18+, donorage >=18 and drop the missing values in continuous variables
+dat <- dat %>% filter(age>=18,donorage>=18) %>% drop_na(age,bmi,donorage,hlamismatchesdr)
+##
+table(dat$gendercode)
+table(dat$donorgendercode)
+table(dat$smokingcode)
+table(dat$coronaryarterycode)
+table(dat$cerebrovasularcode)
+table(dat$diabetescode_text)
+table(dat$hlamismatchesdr)
+table(dat$racialorigincode)
+table(dat$primaryrenaldiseasecode)
+##
+## filter "" from the donorgendercode, smokingcode, coronaryarterycode, cerebrovasularcode
+## and remove unknown from smoking code
+dat <- dat %>% filter(donorgendercode != "", smokingcode != "", smokingcode != "Unknown",
+                      coronaryarterycode != "", cerebrovasularcode != "", diabetescode_text != "")
+##
+## drop category "S" from coronaryarterycode and cerebrovasularcode
+#dat <- dat %>% filter(coronaryarterycode != "S", cerebrovasularcode != "S")
+##
+dat$gendercode <- as.factor(dat$gendercode)
+dat$donorgendercode <- as.factor(dat$donorgendercode)
+dat$smokingcode <- as.factor(dat$smokingcode)
+levels(dat$smokingcode) <- c("Smoker","Smoker","Non-smoker")
+dat$smokingcode <- fct_relevel(dat$smokingcode, "Smoker", after = 1) # "N" = ref category
+dat$coronaryarterycode <- as.factor(dat$coronaryarterycode)
+dat$cerebrovasularcode <- as.factor(dat$cerebrovasularcode)
+dat$diabetescode_text <- as.factor(dat$diabetescode_text)
+levels(dat$diabetescode_text) <- c("N","Y","Y","Y")
+dat$hlamismatchesdr <- as.factor(dat$hlamismatchesdr)
+dat$racialorigincode <- as.factor(dat$racialorigincode)
+##
+cbind(levels(dat$racialorigincode),c("Others","Caucasian","Caucasian","Indigenous",
+                                  "Indigenous","Maori","Caucasian","Others",
+                                  "Others","Others","Others","Others",
+                                  "Caucasian","Caucasian","Caucasian","Caucasian",
+                                  "Others","Others","Others","Others",
+                                  "Others","Others","Others","Others",
+                                  "Others","Others","Others","Others",
+                                  "Caucasian","Caucasian","Others","Others"),
+      c(4,1,1,2,2,3,1,4,4,4,4,4,1,1,1,1,4,4,4,4,4,4,4,4,4,4,4,4,1,1,4,4))
+
+# value                                             label
+#     0                           Response Unidentifiable
+#     1                                        Not Stated
+#    10                                         Caucasoid
+#  1101                             Oceanian - Australian
+#  1102                  Oceanian - Australian Aboriginal
+#  1103          Oceanian - Australian South Sea Islander
+#  1104                 Oceanian - Torres Strait Islander
+#  1201                      Oceanian - New Zealand Maori
+#  1202                   Oceanian - New Zealand European
+#  1300        Oceanian - Melanesian And Papuan (Specify)
+#  1400                  Oceanian - Micronesian (Specify)
+#  1500                   Oceanian - Polynesian (Specify)
+#  1501                                     Cook Islander
+#  1502                                            Fijian
+#  1503                                            Niuean
+#  1504                                            Samoan
+#  1505                                            Tongan
+#  1508                                         Tokelauan
+#  2000                     North-West European (Specify)
+#  3000           Southern and Eastern European (Specify)
+#  3103           Southern and Eastern European - Italian
+#  3205             Southern and Eastern European - Greek
+#  4000        North African and Middle Eastern (Specify)
+#  4100 North African and Middle Eastern - Arab (Specify)
+#  4907        North African and Middle Eastern - Turkish
+#  5000                        South-East Asian (Specify)
+#  5107                     South-East Asian - Vietnamese
+#  5201                       South-East Asian - Filipino
+#  5202                     South-East Asian - Indonesian
+#  5205                          South East Asian - Malay
+#  6000                      North - East Asian (Specify)
+#  6101                      North - East Asian - Chinese
+#  7000              Southern and Central Asian (Specify)
+#  7100                               Southern Asian, nfd
+#  7106               Southern and Central Asian - Indian
+#  7200                                Central Asian, nfd
+#  8100                          North American (Specify)
+#  8105                           Hispanic North American
+#  8200                          South American (Specify)
+#  8300                        Central American (Specify)
+#  8400                      Caribbean Islander (Specify)
+#  9000                     Sub-Saharan African (Specify)
+#  9999                                   Other (Specify)
+
+levels(dat$racialorigincode) <- c("Others","Caucasian","Caucasian","Indigenous",
+                                  "Indigenous","Maori","Caucasian","Others",
+                                  "Others","Others","Others","Others",
+                                  "Caucasian","Caucasian","Caucasian","Caucasian",
+                                  "Others","Others","Others","Others",
+                                  "Others","Others","Others","Others",
+                                  "Others","Others","Others","Others",
+                                  "Caucasian","Caucasian","Others","Others")
+dat$racialorigincode <- fct_relevel(dat$racialorigincode, "Others", after = 3) # "N" = ref category
+##
+dat$primaryrenaldiseasecode <- as.factor(dat$primaryrenaldiseasecode)
+levels(dat$primaryrenaldiseasecode)[1:33] <- rep("Others",33)
+levels(dat$primaryrenaldiseasecode)[2:24] <- rep("Glomerulonephritis",23)
+levels(dat$primaryrenaldiseasecode)[3] <- c("Analgesic Nephropathy")
+levels(dat$primaryrenaldiseasecode)[4:6] <- rep("Vascular",3)
+levels(dat$primaryrenaldiseasecode)[5] <- c("Others")
+levels(dat$primaryrenaldiseasecode)[5] <- c("Vascular")
+levels(dat$primaryrenaldiseasecode)[5:7] <- rep("Cystic",3)
+levels(dat$primaryrenaldiseasecode)[6:9] <- rep("Others",4)
+levels(dat$primaryrenaldiseasecode)[6:8] <- rep("Diabetes",3)
+levels(dat$primaryrenaldiseasecode)[7] <- c("Others")
+dat$primaryrenaldiseasecode <- fct_relevel(dat$primaryrenaldiseasecode, "Others", after = 5) # 
+dat$primaryrenaldiseasecode <- fct_relevel(dat$primaryrenaldiseasecode, "Analgesic Nephropathy", after = 2)
+dat$primaryrenaldiseasecode <- fct_relevel(dat$primaryrenaldiseasecode, "Glomerulonephritis", after = 2) # "Vascular" = ref
+##
+## drop bmi > 100
+dat <- dat %>% filter(bmi <100)
+##
+## select first kidney transplant
+dat <- dat %>% filter(graftno==1)
+##
+summary(dat)
+##
+## missing values in racialorigincode and primaryrenaldiseasecode
+dat <- dat %>% filter_at(vars(racialorigincode, primaryrenaldiseasecode), all_vars(!is.na(.)))
+
+##
+#save(dat,file="datafile_merged_072022.RData") ## 
+load(file="datafile_merged_072022.RData") ## 
+
+##
+## prepare survival data
+##
+load(file="datafile_merged_072022.RData") ## 
+
+datSurv <- dat[,c("id","graftno","alivestatus","aliveperiod","transplantstatus","transplantperiod","ts",
+    "graftfailuredate","lastfollowupdate","transplantdate","endtransplantdate","treatmentdate","deathdate","timeondialysis",
+    "gendercode","bmi","smokingcode", "donorage","donorgendercode","donor_deathcategorycode",
+    "coronaryarterycode","cerebrovasularcode","diabetescode_text","hlamismatchesdr",
+    "racialorigincode","primaryrenaldiseasecode","transplantcentrestate")]
+datSurv <- datSurv %>% distinct()
+dim(datSurv)
+##
+head(table(datSurv$id))
+ck <- table(datSurv$id)
+ck <- names(ck[ck>1])
+##
+## it seems that coronaryarterycode, cerebrovasularcode, diabetescode_text contains duplicate rows. 
+## randomly chose one row from the duplicated ids
+datSurv <- datSurv %>% group_by(id) %>% sample_n(1)
+#aa <- datSurv %>% distinct(id, .keep_all = TRUE)
+#datSurv <- datSurv[!datSurv$id%in%ck,]
+##
+## event time 
+datSurv$et_graftloss_transplant <- datSurv$graftfailuredate-datSurv$transplantdate
+datSurv[is.na(datSurv$et_graftloss_transplant),"et_graftloss_transplant"] = datSurv[is.na(datSurv$et_graftloss_transplant),"lastfollowupdate"] - datSurv[is.na(datSurv$et_graftloss_transplant),"transplantdate"]
+head(datSurv)
+##
+datSurv$ts_firstgfloss <- as.numeric(datSurv$et_graftloss_transplant)/365 # based on first graftloss
+##
+datSurv <- datSurv %>% distinct()
+#save(datSurv,file="datSurv_20220701.RData")
+#save(datSurv,file="datSurv_20220725.RData")
+###
+
+```
+
+### Longitudinal Data
+
+
+```{r longdata}
+################# longitudinal data ##############
+
+load(file="datafile_merged_072022.RData")
+head(dat)
+
+load(file="datSurv_20220725.RData")
+head(datSurv)
+
+## keep it similar to the survival data
+datLong <- dat[dat$id%in%datSurv$id,]
+##
+## convert monthcode variable into years
+datLong$monthcode_lbl <- as_factor(datLong$monthcode)
+datLong$monthcode_yr <- as.numeric(datLong$monthcode)
+datLong[datLong$monthcode_yr%in%2,"monthcode_yr"] <- 0.08219178 # 1 month, i.e., 30/365 = 0.0821
+datLong[datLong$monthcode_yr%in%4,"monthcode_yr"] <- 0.2465753 # 3 months, i.e., 90/365
+datLong[datLong$monthcode_yr%in%5,"monthcode_yr"] <- 0.5 # 6 months, i.e., 
+datLong[datLong$monthcode_yr%in%6,"monthcode_yr"] <- 1 # 1 year, i.e., 
+datLong[datLong$monthcode_yr%in%7,"monthcode_yr"] <- 2 # 2 years, i.e., 
+datLong[datLong$monthcode_yr%in%8,"monthcode_yr"] <- 3 # 3 years, i.e., 
+datLong[datLong$monthcode_yr%in%9,"monthcode_yr"] <- 5 # 5 years, i.e., 
+##
+## select first kidney transplant
+datLong <- datLong[datLong$graftno==1,]
+dim(datLong)
+keep.vars <- names(datLong)[!names(datLong)%in%names(datSurv)]
+keep.vars <- c("id",keep.vars)
+datLong <- datLong[,keep.vars]
+datLong <- datLong %>% distinct()
+#save(datLong,file="datLong_20220701.RData")
+#save(datLong,file="datLong_20220725.RData")
+##
+load(file="datSurv_20220725.RData")
+load(file="datLong_20220725.RData")
+##
+## match the id
+length(unique(datLong$id))
+length(unique(datSurv$id))
+datLong <- datLong[datLong$id%in%unique(datSurv$id),]
+datSurv <- datSurv[datSurv$id%in%unique(datLong$id),]
+##
+## check for the observation times in the longitudinal data are later than their event time
+yr_long <- tapply(datLong$monthcode_yr,datLong$id,max)
+yr_dat <- data.frame(id=names(yr_long),yr_long=unlist(yr_long),yr_surv=datSurv$ts_firstgfloss)
+yr_dat <- yr_dat %>% filter(yr_dat[,2]>yr_dat[,3])
+id_var <- unique(yr_dat$id)
+length(id_var)
+## drop these IDs
+datSurv <- datSurv[!(datSurv$id%in%id_var),]
+datLong <- datLong[!(datLong$id%in%id_var),]
+##
+length(unique(datLong$id))
+length(unique(datSurv$id))
+##
+## merge long and surv
+datLong <- full_join(datLong, datSurv, by = "id")
+##
+saveRDS(datSurv,file="datSurv_202207.rds")
+saveRDS(datLong,file="datLong_202207.rds")
+##
+```
+
+## Bayesian Joint Modelling (graft loss)
+
+```{r jointmodelfit_gf, message=FALSE, warning=FALSE}
+##
+##
+datSurv <- readRDS(file="datSurv_202207.rds")
+datLong <- readRDS(file="datLong_202207.rds")
+
+nrow(datSurv)
+length(unique(datLong$id))
+length(unique(datSurv$id))
+
+## create transplant year variable 
+
+datSurv$tr_yr <- as.numeric(substr(datSurv$transplantdate,1,4))
+datLong$tr_yr <- as.numeric(substr(datLong$transplantdate,1,4))
+
+#datSurv$censored_gf <- NA
+#datSurv[is.na(datSurv$graftfailuredate), "censored_gf"] <- 0
+#datSurv[!is.na(datSurv$graftfailuredate), "censored_gf"] <- 1
+
+## randomly subset the model based on the id - toy example
+
+id_var <- datSurv$id
+set.seed(10001)
+id_sample_test <- sort(sample(x=id_var,size=round(length(id_var)*0.0005),replace = FALSE))
+id_sample <- id_var[!id_var%in%id_sample_test]
+length(id_sample)
+length(id_sample_test)
+
+## Model 2:
+f_long <- egfr_ckdepi ~ donorage + donorgendercode + donor_deathcategorycode + 
+  age + gendercode + bmi + smokingcode + coronaryarterycode + cerebrovasularcode +
+  diabetescode_text + primaryrenaldiseasecode + timeondialysis + hlamismatchesdr + 
+  tr_yr + (monthcode_yr | id)
+
+mod <- stan_jm(formulaLong = f_long,
+                    dataLong = datLong[datLong$id%in%id_sample,],
+                    formulaEvent = survival::Surv(ts_firstgfloss, transplantstatus) ~ donorage + donorgendercode + donor_deathcategorycode + gendercode + bmi + smokingcode + coronaryarterycode + cerebrovasularcode + diabetescode_text + primaryrenaldiseasecode + timeondialysis + hlamismatchesdr + tr_yr, 
+                    dataEvent = datSurv[datSurv$id%in%id_sample,],
+                    time_var = "monthcode_yr",
+                    chains = 1, refresh = 500, iter = 3000, seed = 12345)
+#saveRDS(mod, "mod_20220624.rds")
+##
+
+## up to this point
+
+
+#saveRDS(mod, "mod_gf_mod2.rds")
+mod <- readRDS(file="mod_gf_mod2.rds")
+
+
+
+
+## Model for time to graft loss
+f_long <- egfr_ckdepi ~ age + donorage + bmi + gendercode + serumcreatinine + (monthcode_yr | id)
+#f_long <- egfr_ckdepi ~ age + donorage + as.factor(gendercode) + serumcreatinine + monthcode_yr
+#f_long <- egfr_ckdepi ~ age + gendercode + monthcode_yr + (monthcode_yr | id)
+#f_long <- egfr_ckdepi ~ 1 + (monthcode_yr | id)
+mod_gf <- stan_jm(formulaLong = f_long,
+                  dataLong = datLong[datLong$id%in%id_sample,],
+                  formulaEvent = survival::Surv(ts_firstgfloss, censored_gf) ~ age_ave + gendercode + bmi,
+                  dataEvent = datSurv[datSurv$id%in%id_sample,],
+                  time_var = "monthcode_yr",
+                  chains = 1, refresh = 500, iter = 1000, seed = 12345)
+##
+summary(mod_gf, probs = c(.025,.975))
+#as.data.frame(VarCorr(mod_gf))
+#summary(mod_gf, pars = "assoc")
+rstan::get_stanmodel(mod_gf$stanfit)
+##
+## using variational Bayes
+mod_gf2 <- stan_jm(formulaLong = f_long,
+                  dataLong = datLong[datLong$id%in%id_sample,],
+                  formulaEvent = survival::Surv(ts_firstgfloss, censored_gf) ~ age_ave + gendercode + bmi,
+                  dataEvent = datSurv[datSurv$id%in%id_sample,],
+                  time_var = "monthcode_yr",
+                  algorithm="fullrank",seed = 12345)
+
+```
+
+### Dynamic Prediction for In Sample Data
+
+```{r jointmodeprediction1_gf}
+## Predicted individual-specific trajectory for in-sample individuals
+p1 <- posterior_traj(mod_gf, m = 1, ids = id_sample[1:3], extrapolate = TRUE)
+pp1 <- plot(p1, plot_observed = TRUE, vline = TRUE); #pp1 
+# vertical dashed line at the timing of the individual’s event or censoring time
+p2 <- posterior_survfit(mod_gf, ids = id_sample[1:3])
+pp2 <- plot(p2); #pp2
+plot_stack_jm(yplot = list(pp1), survplot = pp2)
+##
+```
+
+### Dynamic Prediction for Out of Sample Data
+
+```{r jointmodeprediction2_gf}
+## out of sample prediction - working 
+newdatLong <- datLong[datLong$id%in%id_var[1:3], , drop = FALSE]
+newdatSurv <- datSurv[datSurv$id%in%id_var[1:3], , drop = FALSE]
+p1o <- posterior_traj(mod_gf, m = 1,
+                     newdataLong = newdatLong,
+                     newdataEvent = newdatSurv,
+                     last_time = "ts_firstgfloss")
+pp1o <- plot(p1o, plot_observed = TRUE, vline = TRUE)
+p2o <- posterior_survfit(mod_gf,
+                        newdataLong = newdatLong,
+                        newdataEvent = newdatSurv,
+                        last_time = "ts_firstgfloss")
+pp2o <- plot(p2o); #pp2o
+plot_stack_jm(yplot = list(pp1o), survplot = pp2o)
+##
+```
+
+## Bayesian Joint Modelling (alldeath)
+
+```{r jointmodelfit_d, message=FALSE, warning=FALSE}
+
+##
+datSurv <- readRDS(file="datSurv_202204.rds")
+datLong <- readRDS(file="datLong_202204.rds")
+datSurv$gendercode <- as.factor(datSurv$gendercode)
+datLong$gendercode <- as.factor(datLong$gendercode)
+
+## define the censored variable 
+datSurv$censored_d <- NA
+datSurv[is.na(datSurv$deathdate), "censored_d"] <- 0
+datSurv[!is.na(datSurv$deathdate), "censored_d"] <- 1
+
+## remove missing values 
+datSurvd <- datSurv[complete.cases(datSurv$ts_death),]
+datLongd <- datLong[datLong$id%in%datSurvd$id,]
+##
+
+id_var <- datSurvd$id
+set.seed(1234)
+id_sample <- sort(sample(x=id_var,size=round(length(id_var)*0.005),replace = FALSE))
+##
+
+## Model for time to death
+f_long <- egfr_ckdepi ~ age + donorage + gendercode + serumcreatinine + (monthcode_yr | id)
+#f_long <- egfr_ckdepi ~ 1 + (monthcode_yr | id)
+mod_death <- stan_jm(formulaLong = f_long,
+                     dataLong = datLongd[datLongd$id%in%id_sample,],
+                     formulaEvent = survival::Surv(ts_death, censored_d) ~ 1,
+                     dataEvent = datSurvd[datSurvd$id%in%id_sample,],
+                     time_var = "monthcode_yr",
+                     chains = 1, refresh = 500, iter = 1000, seed = 12345)
+##
+summary(mod_death, probs = c(.025,.975))
+#as.data.frame(VarCorr(mod_death))
+#summary(mod_death, pars = "assoc")
+
+```
+
+### Dynamic Prediction for In Sample Data
+
+```{r jointmodeprediction1_d}
+## Predicted individual-specific trajectory for in-sample individuals
+p1 <- posterior_traj(mod_death, m = 1, ids = id_sample[1:3], extrapolate = TRUE)
+pp1 <- plot(p1, plot_observed = TRUE, vline = TRUE); #pp1 
+# vertical dashed line at the timing of the individual’s event or censoring time
+p2 <- posterior_survfit(mod_death, ids = id_sample[1:3])
+pp2 <- plot(p2); #pp2
+plot_stack_jm(yplot = list(pp1), survplot = pp2)
+##
+```
+
+### Dynamic Prediction for Out of Sample Data
+
+```{r jointmodeprediction2_d}
+## out of sample prediction - working 
+newdatLong <- datLong[datLong$id%in%id_var[1:3], , drop = FALSE]
+newdatSurv <- datSurv[datSurv$id%in%id_var[1:3], , drop = FALSE]
+p1o <- posterior_traj(mod_death, m = 1,
+                     newdataLong = newdatLong,
+                     newdataEvent = newdatSurv,
+                     last_time = "ts_death")
+pp1o <- plot(p1o, plot_observed = TRUE, vline = TRUE)
+p2o <- posterior_survfit(mod_death,
+                        newdataLong = newdatLong,
+                        newdataEvent = newdatSurv,
+                        last_time = "ts_death")
+pp2o <- plot(p2o); #pp2o
+plot_stack_jm(yplot = list(pp1o), survplot = pp2o)
+##
+```
