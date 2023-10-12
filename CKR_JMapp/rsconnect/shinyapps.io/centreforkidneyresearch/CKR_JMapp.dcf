@@ -1,0 +1,12 @@
+name: CKR_JMapp
+title: CKR_JMapp
+username: centreforkidneyresearch
+account: centreforkidneyresearch
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 10125186
+bundleId: 7776856
+url: https://centreforkidneyresearch.shinyapps.io/CKR_JMapp/
+version: 1
+asMultiple: FALSE
+asStatic: FALSE
